@@ -1060,7 +1060,14 @@ static void do_sample_stats(args_t *args, stats_t *stats, bcf_sr_t *reader, int 
         bcf_fmt_t *fmt0, *fmt1;
         fmt0 = bcf_get_fmt(files->readers[0].header,files->readers[0].buffer[0],"GT"); if ( !fmt0 ) return;
         fmt1 = bcf_get_fmt(files->readers[1].header,files->readers[1].buffer[0],"GT"); if ( !fmt1 ) return;
-
+        int ndst = 0;
+        float* dst = NULL;
+        int n_val = bcf_get_format_float(files->readers[1].header,files->readers[1].buffer[0],"DS", &dst, &ndst);
+        if (n_val != ndst) {
+          fprintf(stderr, "Error at POS %d \n",  files->readers[1].buffer[0]->pos);
+          exit(1);
+          return;
+        }
         // only the first ALT allele is considered
         if (args->ntmp_iaf <= 1) return; // Do not consider invariate sites
         int iaf = args->tmp_iaf[1];
@@ -1084,7 +1091,8 @@ static void do_sample_stats(args_t *args, stats_t *stats, bcf_sr_t *reader, int 
             if ( type2ploidy[gt0]*type2ploidy[gt1] == -1 ) continue;   // cannot compare diploid and haploid genotypes
 
             float y = type2dosage[gt0];
-            float x = type2dosage[gt1];
+            float x = dst[files->readers[1].samples[is]];
+            // fprintf(stderr, "dosage************%f \n", x);
 
             smpl_stats[is].yx += y*x;
             smpl_stats[is].x  += x;
@@ -1100,6 +1108,7 @@ static void do_sample_stats(args_t *args, stats_t *stats, bcf_sr_t *reader, int 
             af_stats[iaf].yy += y*y;
             af_stats[iaf].n  += 1;
         }
+        free(dst);
 
         if ( args->verbose_sites )
         {
