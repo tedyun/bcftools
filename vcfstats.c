@@ -49,7 +49,7 @@ THE SOFTWARE.  */
 #define QUAL_STATS 1
 #define IRC_STATS 1
 #define IRC_RLEN 10
-#define NA_STRING "0"
+#define NA_STRING "NA"
 
 typedef struct
 {
