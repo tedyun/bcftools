@@ -71,11 +71,11 @@ AC_ARG_WITH([bcf-plugin-path],
      no)  with_bcf_plugin_path= ;;
    esac],
   [with_bcf_plugin_path=$with_bcf_plugin_dir])
-AC_SUBST([PLUGINPATH], $with_bcf_plugin_path)
+AC_SUBST([bcf_pluginpath], $with_bcf_plugin_path)
 
 AC_ARG_ENABLE([perl-filters],
   [AS_HELP_STRING([--enable-perl-filters],
-                  [do not build support for PERL scripts in -i/-e filtering expressions])],
+                  [build in support for PERL scripts in -i/-e filtering expressions])],
   [], [enable_perl_filters=no])
 AC_SUBST(enable_perl_filters)
 
@@ -121,12 +121,14 @@ AS_IF([test "$enable_bcftools_plugins" != "no"], [dnl
       host_result="Cygwin DLL"
       PLATFORM=CYGWIN
       PLUGIN_EXT=.cygdll
+      HTSLIB_DLL=libhts.dll.a
 	  ],
 
     [*-msys* | *-MSYS* | *-mingw* | *-MINGW*],[dnl
       host_result="MSYS dll"
       PLATFORM=MSYS
       PLUGIN_EXT=.dll
+      HTSLIB_DLL=hts.dll.a
 	  # This also sets __USE_MINGW_ANSI_STDIO which in turn makes PRId64,
       # %lld and %z printf formats work.  It also enforces the snprintf to
       # be C99 compliant so it returns the correct values (in kstring.c).
@@ -146,6 +148,7 @@ AS_IF([test "$enable_bcftools_plugins" != "no"], [dnl
   AC_SUBST([PLUGIN_EXT])
   AC_DEFINE_UNQUOTED([PLUGIN_EXT], ["$PLUGIN_EXT"],
                      [Platform-dependent plugin filename extension.])
+  AC_SUBST([HTSLIB_DLL])
   AC_DEFINE([ENABLE_BCF_PLUGINS], 1,
             [Define if BCFtools should enable plugins.])
 
@@ -230,14 +233,26 @@ Either configure with --disable-libgsl or resolve this error to build bcftools.
 ])
 
 AS_IF([test "$enable_perl_filters" != "no" ], [dnl
-    if ! perl -MExtUtils::Embed -e ccopts -e ldopts &>/dev/null ; then
+    save_LIBS="$LIBS"
+    if ! perl -MExtUtils::Embed -e ccopts -e ldopts >/dev/null 2>&1; then
        AC_MSG_ERROR([Cannot `perl -MExtUtils::Embed -e ccopts -e ldopts`])
     fi
     AC_DEFINE([ENABLE_PERL_FILTERS], 1, [Define if BCFtools should enable for support PERL scripts in -i/-e filtering expressions.])
     PERL_CCOPTS="`perl -MExtUtils::Embed -e ccopts`"
     PERL_LIBS="`perl -MExtUtils::Embed -e ldopts`"
+    dnl A hack to remove faulty "-arch i386" on mac as it breaks linking
+    if test "x$PLATFORM" = "xDarwin"; then
+        PERL_CCOPTS="`perl -MExtUtils::Embed -e ccopts | sed 's,-arch i386,,'`"
+        PERL_LIBS="`perl -MExtUtils::Embed -e ldopts | sed 's,-arch i386,,'`"
+    fi
     AC_SUBST([PERL_CCOPTS])
     AC_SUBST([PERL_LIBS])
+
+    dnl Look for libperl
+    AC_SEARCH_LIBS(Perl_call_pv, perl, [], [
+        AC_MSG_ERROR([Unable to find the Perl_call_pv() function for perl filters])
+    ],[$PERL_CCOPTS $PERL_LIBS])
+    LIBS="$save_LIBS"
 ])
 
 dnl Apply value from HTS_PROG_CC_WERROR (if set)

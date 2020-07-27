@@ -1,6 +1,6 @@
 /* The MIT License
 
-   Copyright (c) 2019 Genome Research Ltd.
+   Copyright (c) 2019-2020 Genome Research Ltd.
 
    Author: Petr Danecek <pd3@sanger.ac.uk>
    
@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <getopt.h>
 #include <unistd.h>     // for isatty
 #include <inttypes.h>
@@ -94,10 +95,14 @@ typedef struct
     cols_t *cols_tr,    // the current CSQ tag split into transcripts
         *cols_csq;      // the current CSQ transcript split into fields
     int min_severity, max_severity;     // ignore consequences outside this severity range
+    int drop_sites;                     // the -x, --drop-sites option
     int select_tr;                      // one of SELECT_TR_*
     uint8_t *smpl_pass;                 // for filtering at sample level, used with -f
     int duplicate;              // the -d, --duplicate option is set
     char *all_fields_delim;     // the -A, --all-fields option is set
+    float *farr;                // helper arrays for bcf_update_* functions
+    int32_t *iarr;
+    int niarr,miarr, nfarr,mfarr;
 }
 args_t;
 
@@ -113,21 +118,27 @@ static const char *default_severity(void)
     return
         "# Default consequence substrings ordered in ascending order by severity.\n"
         "# Consequences with the same severity can be put on the same line in arbitrary order.\n"
+        "# See also https://m.ensembl.org/info/genome/variation/prediction/predicted_data.htm\n"
         "intergenic\n"
-        "downstream upstream\n"
-        "intron\n"
-        "non_coding\n"
+        "feature_truncation feature_elongation\n"
         "regulatory\n"
+        "TF_binding_site TFBS\n"
+        "downstream upstream\n"
+        "non_coding_transcript\n"
+        "intron NMD_transcript\n"
+        "non_coding_transcript_exon\n"
         "5_prime_utr 3_prime_utr\n"
+        "coding_sequence mature_miRNA\n"
         "stop_retained start_retained synonymous\n"
+        "incomplete_terminal_codon\n"
         "splice_region\n"
-        "coding_sequence\n"
-        "missense\n"
-        "inframe\n"
+        "missense inframe protein_altering\n"
+        "transcript_amplification\n"
         "exon_loss\n"
         "disruptive\n"
+        "start_lost stop_lost stop_gained frameshift\n"
         "splice_acceptor splice_donor\n"
-        "start_lost stop_lost stop_gained frameshift\n";
+        "transcript_ablation\n";
 }
 static const char *usage_text(void)
 {
@@ -137,30 +148,34 @@ static const char *usage_text(void)
         "   more information and pointers see http://samtools.github.io/bcftools/howtos/plugin.split-vep.html\n"
         "Usage: bcftools +split-vep [Plugin Options]\n"
         "Plugin options:\n"
-        "   -a, --annotation STR        annotation to parse [CSQ]\n"
-        "   -A, --all-fields DELIM      output all fields replacing the -a tag (\"%CSQ\" by default) in the -f\n"
-        "                               filtering expression using the output field delimiter DELIM. This can be\n"
-        "                               \"tab\", \"space\" or an arbitrary string.\n"
-        "   -c, --columns LIST          extract the fields listed either as indexes or names\n"
-        "   -d, --duplicate             output per transcript/allele consequences on a new line rather rather than\n"
-        "                               as comma-separated fields on a single line\n"
-        "   -f, --format <string>       formatting expression, see man page for `bcftools query -f`\n"
-        "   -l, --list                  parse the VCF header and list the annotation fields\n"
-        "   -p, --annot-prefix          prefix of INFO annotations to be created after splitting the CSQ string\n"
-        "   -s, --select TR:CSQ         TR, transcript: worst,primary(*),all          [all]\n"
-        "                               CSQ, consequence: any,missense,missense+,etc  [any]\n"
-        "                               (*) Primary transcripts have the field \"CANONICAL\" set to \"YES\"\n"
-        "   -S, --severity -|FILE       -: print the default severity scale\n"
-        "                               FILE: override the default scale\n"
+        "   -a, --annotation STR        INFO annotation to parse [CSQ]\n"
+        "   -A, --all-fields DELIM      Output all fields replacing the -a tag (\"%CSQ\" by default) in the -f\n"
+        "                                 filtering expression using the output field delimiter DELIM. This can be\n"
+        "                                 \"tab\", \"space\" or an arbitrary string.\n"
+        "   -c, --columns LIST[:type]   Extract the fields listed either as indexes or names. The default type\n"
+        "                                 of the new annotation is String but can be also Integer/Int or Float/Real.\n"
+        "   -d, --duplicate             Output per transcript/allele consequences on a new line rather rather than\n"
+        "                                 as comma-separated fields on a single line\n"
+        "   -f, --format <string>       Formatting expression for non-VCF/BCF output, same as `bcftools query -f`\n"
+        "   -l, --list                  Parse the VCF header and list the annotation fields\n"
+        "   -p, --annot-prefix          Prefix of INFO annotations to be created after splitting the CSQ string\n"
+        "   -s, --select TR:CSQ         Select transcripts to extract by type and/or consequence. (See also the -x switch.)\n"
+        "                                 TR, transcript:   worst,primary(*),all        [all]\n"
+        "                                 CSQ, consequence: any,missense,missense+,etc  [any]\n"
+        "                                 (*) Primary transcripts have the field \"CANONICAL\" set to \"YES\"\n"
+        "   -S, --severity -|FILE       Pass \"-\" to print the default severity scale or FILE to override\n"
+        "                                 the default scale\n"
+        "   -x, --drop-sites            Drop sites with none of the consequences matching the severity specified by -s.\n"
+        "                                  This switch is intended for use with VCF/BCF output (i.e. -f not given).\n"
         "Common options:\n"
-        "   -e, --exclude EXPR          exclude sites and samples for which the expression is true\n"
-        "   -i, --include EXPR          include sites and samples for which the expression is true\n"
-        "   -o, --output FILE           output file name [stdout]\n"
+        "   -e, --exclude EXPR          Exclude sites and samples for which the expression is true\n"
+        "   -i, --include EXPR          Include sites and samples for which the expression is true\n"
+        "   -o, --output FILE           Output file name [stdout]\n"
         "   -O, --output-type b|u|z|v   b: compressed BCF, u: uncompressed BCF, z: compressed VCF or text, v: uncompressed VCF or text [v]\n"
-        "   -r, --regions REG           restrict to comma-separated list of regions\n"
-        "   -R, --regions-file FILE     restrict to regions listed in a file\n"
-        "   -t, --targets REG           similar to -r but streams rather than index-jumps\n"
-        "   -T, --targets-file FILE     similar to -R but streams rather than index-jumps\n"
+        "   -r, --regions REG           Restrict to comma-separated list of regions\n"
+        "   -R, --regions-file FILE     Restrict to regions listed in a file\n"
+        "   -t, --targets REG           Similar to -r but streams rather than index-jumps\n"
+        "   -T, --targets-file FILE     Similar to -R but streams rather than index-jumps\n"
         "\n"
         "Examples:\n"
         "   # List available fields of the INFO/CSQ annotation\n"
@@ -180,6 +195,16 @@ static const char *usage_text(void)
         "\n"
         "   # Print all subfields (tab-delimited) in place of %CSQ, each consequence on a new line\n"
         "   bcftools +split-vep -f '%CHROM %POS %CSQ\\n' -d -A tab file.vcf.gz\n"
+        "\n"
+        "   # Extract gnomAD_AF subfield into a new INFO/gnomAD_AF annotation of Type=Float so that\n"
+        "   # numeric filtering can be used.\n"
+        "   bcftools +split-vep -c gnomAD_AF:Float file.vcf.gz -i'gnomAD_AF<0.001'\n"
+        "\n"
+        "   # Similar to above, but add the annotation only if the consequence severity is missense\n"
+        "   # or equivalent. In order to drop sites with different consequences completely, we add\n"
+        "   # the -x switch. See the online documentation referenced above for more examples.\n"
+        "   bcftools +split-vep -c gnomAD_AF:Float -s :missense    file.vcf.gz\n"
+        "   bcftools +split-vep -c gnomAD_AF:Float -s :missense -x file.vcf.gz\n"
         "\n";
 }
 
@@ -245,7 +270,7 @@ static void init_data(args_t *args)
         char tmp = *ep;
         *ep = 0;
         args->nfield++;
-        args->field = realloc(args->field,args->nfield*sizeof(*args->field));
+        args->field = (char**)realloc(args->field,args->nfield*sizeof(*args->field));
         args->field[args->nfield-1] = strdup(bp);
         if ( !tmp ) break;
         ep++;
@@ -299,7 +324,7 @@ static void init_data(args_t *args)
 
             int olen = args->column_str ? strlen(args->column_str) : 0;
             int nlen = strlen(ptr) - 1;
-            args->column_str = realloc(args->column_str, olen + nlen + 2);
+            args->column_str = (char*)realloc(args->column_str, olen + nlen + 2);
             if ( olen )
             {
                 memcpy(args->column_str+olen,",",1);
@@ -320,36 +345,67 @@ static void init_data(args_t *args)
     if ( args->column_str )
     {
         int *column = NULL;
+        int *types  = NULL;
         ep = args->column_str;
         while ( *ep )
         {
-            char *bp = ep;
+            char *tp, *bp = ep;
             while ( *ep && *ep!=',' ) ep++;
             char tmp = *ep;
             *ep = 0;
+            int type = BCF_HT_STR;
             int idx_beg, idx_end;
             if ( khash_str2int_get(args->field2idx, bp, &idx_beg)==0 )
                 idx_end = idx_beg;
+            else if ( (tp=strrchr(bp,':')) )
+            {
+                *tp = 0;
+                if ( khash_str2int_get(args->field2idx, bp, &idx_beg)!=0 )
+                {
+                    *tp = ':';
+                    error("No such column: \"%s\"\n", bp);
+                }
+                idx_end = idx_beg;
+                *tp = ':';
+                if ( !strcasecmp(tp+1,"string") ) type = BCF_HT_STR;
+                else if ( !strcasecmp(tp+1,"float") || !strcasecmp(tp+1,"real") ) type = BCF_HT_REAL;
+                else if ( !strcasecmp(tp+1,"integer") || !strcasecmp(tp+1,"int") ) type = BCF_HT_INT;
+                else if ( !strcasecmp(tp+1,"flag") ) type = BCF_HT_FLAG;
+                else error("The type \"%s\" (or column \"%s\"?) not recognised\n", tp+1,bp);
+            }
             else
             {
                 char *mp;
                 idx_beg = strtol(bp,&mp,10);
                 if ( !*mp ) idx_end = idx_beg;
                 else if ( *mp=='-' )
-                {
                     idx_end = strtol(mp+1,&mp,10);
-                    if ( *mp ) error("No such column: \"%s\"\n", bp);
+                if ( *mp )
+                {
+                    if ( *mp==':' )
+                    {
+                        idx_end = idx_beg;
+                        if ( !strcasecmp(mp+1,"string") ) type = BCF_HT_STR;
+                        else if ( !strcasecmp(mp+1,"float") || !strcasecmp(mp+1,"real") ) type = BCF_HT_REAL;
+                        else if ( !strcasecmp(mp+1,"integer") || !strcasecmp(mp+1,"int") ) type = BCF_HT_INT;
+                        else if ( !strcasecmp(mp+1,"flag") ) type = BCF_HT_FLAG;
+                        else error("The type \"%s\" (or column \"%s\"?) not recognised\n", mp+1,bp);
+                    }
+                    else 
+                        error("No such column: \"%s\"\n", bp);
                 }
-                else error("No such column: \"%s\"\n", bp);
             }
 
             i = args->nannot;
             args->nannot += idx_end - idx_beg + 1;
-            column = realloc(column,args->nannot*sizeof(*column));
+            column = (int*)realloc(column,args->nannot*sizeof(*column));
+            types  = (int*)realloc(types,args->nannot*sizeof(*types));
             for (j=idx_beg; j<=idx_end; j++)
             {
                 if ( j >= args->nfield ) error("The index is too big: %d\n", j);
-                column[i++] = j;
+                column[i] = j;
+                types[i]  = type;
+                i++;
             }
             if ( !tmp ) break;
             ep++;
@@ -359,7 +415,7 @@ static void init_data(args_t *args)
         for (i=0; i<args->nannot; i++)
         {
             annot_t *ann = &args->annot[i];
-            ann->type = BCF_HT_STR;
+            ann->type = types[i];
             ann->idx = j = column[i];
             ann->field = strdup(args->field[j]);
             int clen = strlen(args->field[j]);
@@ -367,9 +423,16 @@ static void init_data(args_t *args)
             if ( len ) memcpy(ann->tag,args->annot_prefix,len);
             memcpy(ann->tag+len,ann->field,clen);
             ann->tag[len+clen] = 0;
-            bcf_hdr_printf(args->hdr_out, "##INFO=<ID=%s,Number=.,Type=String,Description=\"The %s field from INFO/%s\">", ann->tag,ann->field,args->vep_tag);
+            args->kstr.l = 0;
+            char *type = "String";
+            if ( ann->type==BCF_HT_REAL ) type = "Float";
+            else if ( ann->type==BCF_HT_INT ) type = "Integer";
+            else if ( ann->type==BCF_HT_FLAG ) type = "Flag";
+            ksprintf(&args->kstr,"##INFO=<ID=%%s,Number=.,Type=%s,Description=\"The %%s field from INFO/%%s\">",type);
+            bcf_hdr_printf(args->hdr_out, args->kstr.s, ann->tag,ann->field,args->vep_tag);
         }
         free(column);
+        free(types);
 
         if ( bcf_hdr_sync(args->hdr_out)<0 )
             error_errno("[%s] Failed to update header", __func__);
@@ -464,6 +527,8 @@ static void init_data(args_t *args)
 }
 static void destroy_data(args_t *args)
 {
+    free(args->farr);
+    free(args->iarr);
     free(args->kstr.s);
     free(args->column_str);
     free(args->format_str);
@@ -601,6 +666,56 @@ static void annot_append(annot_t *ann, char *value)
     if ( ann->str.l ) kputc(',',&ann->str);
     kputs(value, &ann->str);
 }
+static inline void parse_array_real(char *str, float **arr, int *marr, int *narr)
+{
+    char *bp = str, *ep;
+    float *ptr = *arr;
+    int i, n = 1, m = *marr;
+    for (i=0; *bp; bp++)
+        if ( *bp == ',' ) n++;
+
+    hts_expand(float*,n,m,ptr);
+
+    i = 0;
+    bp = str;
+    while ( *bp )
+    {
+        ptr[i] = strtod(bp, &ep);
+        if ( bp==ep )
+            bcf_float_set_missing(ptr[i]);
+        i++;
+        while ( *ep && *ep!=',' ) ep++;
+        bp = *ep ? ep + 1 : ep;
+    }
+    *narr = i;
+    *marr = m;
+    *arr  = ptr;
+}
+static inline void parse_array_int32(char *str, int **arr, int *marr, int *narr)
+{
+    char *bp = str, *ep;
+    int32_t *ptr = *arr;
+    int i, n = 1, m = *marr;
+    for (i=0; *bp; bp++)
+        if ( *bp == ',' ) n++;
+
+    hts_expand(int32_t*,n,m,ptr);
+
+    i = 0;
+    bp = str;
+    while ( *bp )
+    {
+        ptr[i] = strtol(bp, &ep, 10);
+        if ( bp==ep )
+            ptr[i] = bcf_int32_missing;
+        i++;
+        while ( *ep && *ep!=',' ) ep++;
+        bp = *ep ? ep + 1 : ep;
+    }
+    *narr = i;
+    *marr = m;
+    *arr  = ptr;
+}
 static void filter_and_output(args_t *args, bcf1_t *rec, int severity_pass, int all_missing)
 {
     int i, updated = 0;
@@ -608,7 +723,18 @@ static void filter_and_output(args_t *args, bcf1_t *rec, int severity_pass, int 
     {
         annot_t *ann = &args->annot[i];
         if ( !ann->str.l ) continue;
-        bcf_update_info_string(args->hdr_out,rec,ann->tag,ann->str.s);
+        if ( ann->type==BCF_HT_REAL )
+        {
+            parse_array_real(ann->str.s,&args->farr,&args->mfarr,&args->nfarr);
+            bcf_update_info_float(args->hdr_out,rec,ann->tag,args->farr,args->nfarr);
+        }
+        else if ( ann->type==BCF_HT_INT )
+        {
+            parse_array_int32(ann->str.s,&args->iarr,&args->miarr,&args->niarr);
+            bcf_update_info_int32(args->hdr_out,rec,ann->tag,args->iarr,args->niarr);
+        }
+        else
+            bcf_update_info_string(args->hdr_out,rec,ann->tag,ann->str.s);
         updated++;
     }
     if ( args->filter )
@@ -689,6 +815,7 @@ static void process_record(args_t *args, bcf1_t *rec)
                 all_missing = 0;
             }
         }
+        
         if ( args->duplicate )
         {
             filter_and_output(args, rec, severity_pass, all_missing);
@@ -697,6 +824,7 @@ static void process_record(args_t *args, bcf1_t *rec)
             severity_pass = 0;
         }
     }
+    if ( !severity_pass && args->drop_sites ) return;
     if ( !args->duplicate )
         filter_and_output(args, rec, severity_pass, all_missing);
 }
@@ -710,6 +838,7 @@ int run(int argc, char **argv)
     args->vep_tag = "CSQ";
     static struct option loptions[] =
     {
+        {"drop-sites",no_argument,0,'x'},
         {"all-fields",no_argument,0,'A'},
         {"duplicate",no_argument,0,'d'},
         {"format",required_argument,0,'f'},
@@ -730,7 +859,7 @@ int run(int argc, char **argv)
         {NULL,0,NULL,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "o:O:i:e:r:R:t:T:lS:s:c:p:a:f:dA:",loptions,NULL)) >= 0)
+    while ((c = getopt_long(argc, argv, "o:O:i:e:r:R:t:T:lS:s:c:p:a:f:dA:x",loptions,NULL)) >= 0)
     {
         switch (c) 
         {
@@ -739,6 +868,7 @@ int run(int argc, char **argv)
                 else if ( !strcasecmp(optarg,"space") ) args->all_fields_delim = " ";
                 else args->all_fields_delim = optarg;
                 break;
+            case 'x': args->drop_sites = 1; break;
             case 'd': args->duplicate = 1; break;
             case 'f': args->format_str = strdup(optarg); break;
             case 'a': args->vep_tag = optarg; break;
@@ -768,6 +898,7 @@ int run(int argc, char **argv)
             default: error("%s", usage_text()); break;
         }
     }
+    if ( args->drop_sites && args->format_str ) error("Error: the -x behavior is the default (and only supported) with -f\n");
     if ( args->all_fields_delim && !args->format_str ) error("Error: the -A option must be used with -f\n");
     if ( args->severity && (!strcmp("?",args->severity) || !strcmp("-",args->severity)) ) error("%s", default_severity());
     if ( optind==argc )
@@ -784,7 +915,13 @@ int run(int argc, char **argv)
         list_header(args);
     else
     {
-        if ( !args->format_str && !args->column_str ) error("Error: neither -c nor -f was given, use \"bcftools view\" instead.\n");
+        if ( !args->format_str && !args->column_str )
+        {
+            if ( args->min_severity==SELECT_CSQ_ANY && args->max_severity==SELECT_CSQ_ANY )
+                error("Error: none of the -c,-f,-s options was given, why not use \"bcftools view\" instead?\n");
+            else if ( !args->drop_sites )
+                error("Error: when the -s option is used without -x, everything is printed; why not use \"bcftools view\" instead?\n");
+        }
 
         if ( args->format_str )
             args->fh_bgzf = bgzf_open(args->output_fname, args->output_type&FT_GZ ? "wg" : "wu");

@@ -1,6 +1,6 @@
 /*  vcfmerge.c -- Merge multiple VCF/BCF files to create one multi-sample file.
 
-    Copyright (C) 2012-2019 Genome Research Ltd.
+    Copyright (C) 2012-2020 Genome Research Ltd.
 
     Author: Petr Danecek <pd3@sanger.ac.uk>
 
@@ -25,6 +25,7 @@ THE SOFTWARE.  */
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <assert.h>
 #include <errno.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -141,7 +142,7 @@ typedef struct
     maux_t *maux;
     regidx_t *regs;    // apply regions only after the blocks are expanded
     regitr_t *regs_itr;
-    int header_only, collapse, output_type, force_samples, merge_by_id, do_gvcf, filter_logic, missing_to_ref;
+    int header_only, collapse, output_type, force_samples, merge_by_id, do_gvcf, filter_logic, missing_to_ref, no_index;
     char *header_fname, *output_fname, *regions_list, *info_rules, *file_list;
     faidx_t *gvcf_fai;
     info_rule_t *rules;
@@ -689,7 +690,7 @@ maux_t *maux_init(args_t *args)
     assert( n_smpl==bcf_hdr_nsamples(args->out_hdr) );
     if ( args->do_gvcf )
     {
-        ma->gvcf = (gvcf_aux_t*) calloc(ma->n,sizeof(gvcf_aux_t));
+        ma->gvcf = (gvcf_aux_t*) calloc(ma->n,sizeof(gvcf_aux_t));  // -Walloc-size-larger-than gives a harmless warning caused by signed integer ma->n
         for (i=0; i<ma->n; i++)
             ma->gvcf[i].line = bcf_init1();
     }
@@ -1333,7 +1334,7 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     int i, ismpl = 0, nsamples = bcf_hdr_nsamples(out_hdr);
     static int warned = 0;
 
-    int nsize = 0, msize = sizeof(int32_t);
+    int nsize = 0;
     for (i=0; i<files->nreaders; i++)
     {
         bcf_fmt_t *fmt = fmt_map[i];
@@ -1343,17 +1344,18 @@ void merge_GT(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     }
     if ( nsize==0 ) nsize = 1;
 
-    if ( ma->ntmp_arr < nsamples*nsize*msize )
+    size_t msize = sizeof(int32_t)*nsize*nsamples;
+    if ( msize > 2147483647 )
     {
-        ma->ntmp_arr = nsamples*nsize*msize;
-        ma->tmp_arr  = realloc(ma->tmp_arr, ma->ntmp_arr);
-        if ( !ma->tmp_arr ) error("Could not allocate %zu bytes\n",ma->ntmp_arr);
-        if ( ma->ntmp_arr > 2147483647 )
-        {
-            if ( !warned ) fprintf(stderr,"Warning: Too many genotypes at %s:%"PRId64", requires %zu bytes, skipping.\n", bcf_seqname(out_hdr,out),(int64_t) out->pos+1,ma->ntmp_arr);
-            warned = 1;
-            return;
-        }
+        if ( !warned ) fprintf(stderr,"Warning: Too many genotypes at %s:%"PRId64", requires %zu bytes, skipping.\n", bcf_seqname(out_hdr,out),(int64_t) out->pos+1,msize);
+        warned = 1;
+        return;
+    }
+    if ( ma->ntmp_arr < msize )
+    {
+        ma->tmp_arr  = realloc(ma->tmp_arr, msize);
+        if ( !ma->tmp_arr ) error("Could not allocate %zu bytes\n",msize);
+        ma->ntmp_arr = msize;
     }
     memset(ma->smpl_ploidy,0,nsamples*sizeof(int));
 
@@ -1520,17 +1522,18 @@ void merge_format_string(args_t *args, const char *key, bcf_fmt_t **fmt_map, bcf
               "If you don't really need it, use `bcftools annotate -x` to remove the annotation before merging.\n", __func__,key);
     }
     // update the record
-    if ( ma->ntmp_arr < nsamples*nmax )
+    size_t msize = nsamples*nmax;
+    if ( msize > 2147483647 )
     {
-        ma->ntmp_arr = nsamples*nmax;
-        ma->tmp_arr  = realloc(ma->tmp_arr, ma->ntmp_arr);
-        if ( !ma->tmp_arr ) error("Could not allocate %zu bytes\n",ma->ntmp_arr);
-        if ( ma->ntmp_arr > 2147483647 )
-        {
-            if ( !warned ) fprintf(stderr,"Warning: The row size is too big for FORMAT/%s at %s:%"PRId64", requires %zu bytes, skipping.\n", key,bcf_seqname(out_hdr,out),(int64_t) out->pos+1,ma->ntmp_arr);
-            warned = 1;
-            return;
-        }
+        if ( !warned ) fprintf(stderr,"Warning: The row size is too big for FORMAT/%s at %s:%"PRId64", requires %zu bytes, skipping.\n", key,bcf_seqname(out_hdr,out),(int64_t) out->pos+1,msize);
+        warned = 1;
+        return;
+    }
+    if ( ma->ntmp_arr < msize )
+    {
+        ma->tmp_arr  = realloc(ma->tmp_arr, msize);
+        if ( !ma->tmp_arr ) error("Could not allocate %zu bytes\n",msize);
+        ma->ntmp_arr = msize;
     }
     char *tgt = (char*) ma->tmp_arr;
     for (i=0; i<nsamples; i++)
@@ -1586,17 +1589,18 @@ void merge_format_field(args_t *args, bcf_fmt_t **fmt_map, bcf1_t *out)
     }
 
     size_t msize = sizeof(float)>sizeof(int32_t) ? sizeof(float) : sizeof(int32_t);
-    if ( ma->ntmp_arr < nsamples*nsize*msize )
+    msize *= nsamples*nsize;
+    if ( msize > 2147483647 )
     {
-        ma->ntmp_arr = nsamples*nsize*msize;
-        ma->tmp_arr  = realloc(ma->tmp_arr, ma->ntmp_arr);
-        if ( !ma->tmp_arr ) error("Failed to allocate %zu bytes at %s:%"PRId64" for FORMAT/%s\n", ma->ntmp_arr,bcf_seqname(args->out_hdr,out),(int64_t) out->pos+1,key);
-        if ( ma->ntmp_arr > 2147483647 )
-        {
-            if ( !warned ) fprintf(stderr,"Warning: The row size is too big for FORMAT/%s at %s:%"PRId64", requires %zu bytes, skipping.\n", key,bcf_seqname(out_hdr,out),(int64_t) out->pos+1,ma->ntmp_arr);
-            warned = 1;
-            return;
-        }
+        if ( !warned ) fprintf(stderr,"Warning: The row size is too big for FORMAT/%s at %s:%"PRId64", requires %zu bytes, skipping.\n", key,bcf_seqname(out_hdr,out),(int64_t) out->pos+1,msize);
+        warned = 1;
+        return;
+    }
+    if ( ma->ntmp_arr < msize )
+    {
+        ma->tmp_arr  = realloc(ma->tmp_arr, msize);
+        if ( !ma->tmp_arr ) error("Failed to allocate %zu bytes at %s:%"PRId64" for FORMAT/%s\n", msize,bcf_seqname(args->out_hdr,out),(int64_t) out->pos+1,key);
+        ma->ntmp_arr = msize;
     }
 
     // Fill the temp array for all samples by collecting values from all files
@@ -2041,6 +2045,23 @@ void gvcf_flush(args_t *args, int done)
     }
 }
 
+static inline int is_gvcf_block(bcf1_t *line)
+{
+    if ( line->rlen<=1 ) return 0;
+    if ( strlen(line->d.allele[0])==line->rlen ) return 0;
+    if ( line->n_allele==1 ) return 1;
+
+    int i;
+    for (i=1; i<line->n_allele; i++)
+    {
+        if ( !strcmp(line->d.allele[i],"<*>") ) return 1;
+        if ( !strcmp(line->d.allele[i],"<NON_REF>") ) return 1;
+        if ( !strcmp(line->d.allele[i],"<X>") ) return 1;
+    }
+    return 0;
+}
+static const int snp_mask = (VCF_SNP<<2)|(VCF_MNP<<2), indel_mask = VCF_INDEL<<2, ref_mask = 2;
+
 /*
     Check incoming lines for new gVCF blocks, set pointer to the current source
     buffer (gvcf or readers).  In contrast to gvcf_flush, this function can be
@@ -2059,6 +2080,7 @@ void gvcf_stage(args_t *args, int pos)
     maux->gvcf_min = INT_MAX;
     for (i=0; i<files->nreaders; i++)
     {
+        if ( gaux[i].active && gaux[i].end < pos ) gaux[i].active = 0;
         if ( gaux[i].active )
         {
             // gvcf block should not overlap with another record
@@ -2077,7 +2099,7 @@ void gvcf_stage(args_t *args, int pos)
         int irec = maux->buf[i].beg;
         bcf_hdr_t *hdr = bcf_sr_get_header(files, i);
         bcf1_t *line = args->files->readers[i].buffer[irec];
-        int ret = bcf_get_info_int32(hdr,line,"END",&end,&nend);
+        int ret = is_gvcf_block(line) ? bcf_get_info_int32(hdr,line,"END",&end,&nend) : 0;
         if ( ret==1 )
         {
             if ( end[0] == line->pos + 1 )  // POS and INFO/END are identical, treat as if a normal w/o INFO/END
@@ -2218,7 +2240,6 @@ void debug_state(args_t *args)
     fprintf(stderr,"\n");
 }
 
-
 /*
    Determine which line should be merged from which reader: go through all
    readers and all buffered lines, expand REF,ALT and try to match lines with
@@ -2227,7 +2248,6 @@ void debug_state(args_t *args)
 int can_merge(args_t *args)
 {
     bcf_srs_t *files = args->files;
-    int snp_mask = (VCF_SNP<<1)|(VCF_MNP<<1), indel_mask = VCF_INDEL<<1, ref_mask = 1;
     maux_t *maux = args->maux;
     gvcf_aux_t *gaux = maux->gvcf;
     char *id = NULL, ref = 'N';
@@ -2239,6 +2259,9 @@ int can_merge(args_t *args)
         maux->als[i] = NULL;
     }
     maux->var_types = maux->nals = 0;
+
+    // this is only for the `-m none -g` mode, ensure that <*> lines come last
+    #define VCF_GVCF_REF 1
 
     for (i=0; i<files->nreaders; i++)
     {
@@ -2257,12 +2280,17 @@ int can_merge(args_t *args)
             buf->rec[j].skip = SKIP_DIFF;
             ntodo++;
 
+            bcf1_t *line = buf->lines[j];
             if ( args->merge_by_id )
-                id = buf->lines[j]->d.id;
+                id = line->d.id;
             else
             {
-                int var_type = bcf_get_variant_types(buf->lines[j]);
-                maux->var_types |= var_type ? var_type<<1 : 1;
+                int var_type = bcf_get_variant_types(line);
+                maux->var_types |= var_type ? var_type<<2 : 2;
+
+                // for the `-m none -g` mode
+                if ( args->collapse==COLLAPSE_NONE && args->do_gvcf && is_gvcf_block(line) )
+                    maux->var_types |= VCF_GVCF_REF;
             }
         }
 
@@ -2294,7 +2322,7 @@ int can_merge(args_t *args)
             bcf1_t *line = buf->lines[j]; // ptr to reader's buffer or gvcf buffer
 
             int line_type = bcf_get_variant_types(line);
-            line_type = line_type ? line_type<<1 : 1;
+            line_type = line_type ? line_type<<2 : 2;
 
             // select relevant lines
             if ( args->merge_by_id )
@@ -2303,6 +2331,12 @@ int can_merge(args_t *args)
             }
             else
             {
+                // when merging gVCF in -m none mode, make sure that gVCF blocks with the same POS as variant
+                // records come last, otherwise infinite loop is created (#1164)
+                if ( args->collapse==COLLAPSE_NONE && args->do_gvcf )
+                {
+                    if ( is_gvcf_block(line) && (maux->var_types & (~(VCF_GVCF_REF|2))) ) continue;
+                }
                 if ( args->collapse==COLLAPSE_NONE && maux->nals )
                 {
                     // All alleles of the tested record must be present in the
@@ -2366,7 +2400,6 @@ int can_merge(args_t *args)
 */
 void stage_line(args_t *args)
 {
-    int snp_mask = (VCF_SNP<<1)|(VCF_MNP<<1), indel_mask = VCF_INDEL<<1, ref_mask = 1;
     bcf_srs_t *files = args->files;
     maux_t *maux = args->maux;
 
@@ -2581,6 +2614,7 @@ static void usage(void)
     fprintf(stderr, "    -i, --info-rules <tag:method,..>   rules for merging INFO fields (method is one of sum,avg,min,max,join) or \"-\" to turn off the default [DP:sum,DP4:sum]\n");
     fprintf(stderr, "    -l, --file-list <file>             read file names from the file\n");
     fprintf(stderr, "    -m, --merge <string>               allow multiallelic records for <snps|indels|both|all|none|id>, see man page for details [both]\n");
+    fprintf(stderr, "        --no-index                     merge unindexed files, the same chromosomal order is required and -r/-R are not allowed\n");
     fprintf(stderr, "        --no-version                   do not append version and command line to the header\n");
     fprintf(stderr, "    -o, --output <file>                write output to a file [standard output]\n");
     fprintf(stderr, "    -O, --output-type <b|u|z|v>        'b' compressed BCF; 'u' uncompressed BCF; 'z' compressed VCF; 'v' uncompressed VCF [v]\n");
@@ -2622,6 +2656,7 @@ int main_vcfmerge(int argc, char *argv[])
         {"regions-file",required_argument,NULL,'R'},
         {"info-rules",required_argument,NULL,'i'},
         {"no-version",no_argument,NULL,8},
+        {"no-index",no_argument,NULL,10},
         {"filter-logic",required_argument,NULL,'F'},
         {NULL,0,NULL,0}
     };
@@ -2672,6 +2707,7 @@ int main_vcfmerge(int argc, char *argv[])
             case  3 : args->force_samples = 1; break;
             case  9 : args->n_threads = strtol(optarg, 0, 0); break;
             case  8 : args->record_cmd_line = 0; break;
+            case 10 : args->no_index = 1; break;
             case 'h':
             case '?': usage(); break;
             default: error("Unknown argument: %s\n", optarg);
@@ -2680,7 +2716,13 @@ int main_vcfmerge(int argc, char *argv[])
     if ( argc==optind && !args->file_list ) usage();
     if ( argc-optind<2 && !args->file_list ) usage();
 
-    args->files->require_index = 1;
+    if ( args->no_index )
+    {
+        if ( args->regions_list ) error("Error: cannot combine --no-index with -r/-R\n");
+        bcf_sr_set_opt(args->files,BCF_SR_ALLOW_NO_IDX);
+    }
+    else
+        bcf_sr_set_opt(args->files,BCF_SR_REQUIRE_IDX);
     if ( args->regions_list )
     {
         if ( bcf_sr_set_regions(args->files, args->regions_list, regions_is_file)<0 )
